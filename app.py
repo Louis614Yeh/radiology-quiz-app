@@ -6,11 +6,11 @@ import google.generativeai as genai
 # ==========================================
 # ⚙️ 初始設定與 AI 配置
 # ==========================================
-st.set_page_config(page_title="放射師國考刷題神器 V3.6", layout="wide")
+st.set_page_config(page_title="放射師國考刷題神器 V3.7", layout="wide")
 
 try:
     if "GEMINI_API_KEY" in st.secrets:
-        genai.configure(api_key=st.secrets["GEMINI_API_KEY"].strip()) # .strip() 幫您自動清除不小心的空格
+        genai.configure(api_key=st.secrets["GEMINI_API_KEY"].strip())
         model = genai.GenerativeModel('gemini-1.5-flash') 
     else:
         st.warning("⚠️ 未偵測到 API Key，請至 Streamlit Secrets 設定。")
@@ -20,12 +20,11 @@ except Exception as e:
     model = None
 
 # ==========================================
-# 📂 暫存記憶體設定 (解決題目秒消失問題)
+# 📂 暫存記憶體設定
 # ==========================================
 if 'answered_this_round' not in st.session_state:
     st.session_state['answered_this_round'] = []
 
-# 當換頁、換科目時，清空剛答對的暫存清單
 def clear_cache():
     st.session_state['answered_this_round'] = []
 
@@ -111,20 +110,18 @@ if st.sidebar.button("🗑️ 清除當前使用者進度"):
     st.rerun()
 
 # ==========================================
-# 🧠 核心過濾邏輯
+# 🧠 核心過濾邏輯 (修復標記題庫消失 Bug)
 # ==========================================
 df_view = df_full.copy()
 if selected_year != "全部年度":
     df_view = df_view[df_view['年度-期別'] == str(selected_year)]
 
-# 【完美體驗版】隱藏已答對，但保留「剛答對還沒翻頁」的題目
-if hide_done:
+# 【核心修正】只有在「非標記題庫」模式下，才執行「隱藏已答對題目」的功能！
+if hide_done and mode != "標記題庫":
     history = load_user_records("history")
     u_hist = history[history['user_id'] == str(u_id)].copy()
     if not u_hist.empty:
-        # 將題目轉為字串 ID 來比對
         u_hist['q_key_str'] = u_hist['年度-期別'].astype(str) + "_" + u_hist['題號'].astype(str)
-        # 排除掉這一回合才剛答對的題目（讓它們繼續留在畫面上）
         u_hist_to_hide = u_hist[~u_hist['q_key_str'].isin(st.session_state['answered_this_round'])]
         
         df_view = df_view.merge(u_hist_to_hide[['年度-期別', '題號']], on=['年度-期別', '題號'], how='left', indicator=True)
@@ -147,7 +144,6 @@ total_q = len(df_view)
 total_pages = max((total_q - 1) // q_per_page + 1, 1)
 
 if total_q > 0:
-    # 當頁數改變時，清空剛答對的暫存清單，讓隱藏邏輯生效
     page = st.sidebar.number_input(f"頁數 (共 {total_pages} 頁)", 1, total_pages, 1, on_change=clear_cache)
     df_page = df_view.iloc[(page-1)*q_per_page : page*q_per_page]
     st.caption(f"目前篩選出 {total_q} 題，正在顯示第 {page} 頁")
@@ -189,7 +185,6 @@ for _, row in df_page.iterrows():
         if c1.button("送出答案", key=f"sub_{q_key}"):
             if user_choice == str(row['正確答案']):
                 st.success("✅ 正確！")
-                # 存檔，並加入「本回合暫存區」，讓題目暫時不下架
                 save_record("history", u_id, subject, row['年度-期別'], row['題號'], "add")
                 st.session_state['answered_this_round'].append(str_key)
             elif user_choice is None:
@@ -206,6 +201,6 @@ for _, row in df_page.iterrows():
                         response = model.generate_content(prompt)
                         st.info(response.text)
                     except Exception as ai_e:
-                        st.error(f"請確認 API Key 格式是否正確。系統錯誤：{ai_e}")
+                        st.error(f"連線失敗：{ai_e}")
             else:
                 st.error("請先在 Secrets 設定正確的 GEMINI_API_KEY。")
