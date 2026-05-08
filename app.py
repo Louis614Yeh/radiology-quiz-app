@@ -6,24 +6,21 @@ import google.generativeai as genai
 # ==========================================
 # ⚙️ 初始設定與 AI 配置
 # ==========================================
-st.set_page_config(page_title="放射師國考刷題神器 V3.3", layout="wide")
+st.set_page_config(page_title="放射師國考刷題神器 V3.4", layout="wide")
 
-# 安全讀取 API Key (請確保 Secrets 裡的 Key 名稱完全正確)
 try:
     GOOGLE_API_KEY = st.secrets["GEMINI_API_KEY"]
     genai.configure(api_key=GOOGLE_API_KEY)
-    # 若 1.5-flash 持續 403，可嘗試改為 'gemini-pro'
     model = genai.GenerativeModel('gemini-1.5-flash') 
 except Exception as e:
     st.error("⚠️ 無法連線 AI。請確認 Streamlit 後台 Secrets 設定。")
     st.stop()
 
 # ==========================================
-# 📂 資料處理函數
+# 📂 資料處理函數 (加入防呆機制)
 # ==========================================
 @st.cache_data
 def load_quiz_data():
-    # 支援 Excel 或您後來上傳的 CSV 備份
     try:
         excel_file = pd.ExcelFile('exam_db.xlsx') 
         db = {sheet: excel_file.parse(sheet) for sheet in excel_file.sheet_names}
@@ -33,10 +30,22 @@ def load_quiz_data():
         st.stop()
 
 def load_user_records(data_type):
+    """【升級】自動檢查欄位，若舊檔案格式不對則自動重建，防止 KeyError"""
     file = f"user_{data_type}.csv"
+    expected_cols = ['user_id', '科目', '年度-期別', '題號']
+    
     if os.path.exists(file):
-        return pd.read_csv(file).astype(str)
-    return pd.DataFrame(columns=['user_id', '科目', '年度-期別', '題號'])
+        try:
+            df = pd.read_csv(file).astype(str)
+            # 檢查是否包含所有必須的欄位
+            if all(col in df.columns for col in expected_cols):
+                return df
+            else:
+                st.toast(f"⚠️ 發現舊版 {data_type} 紀錄檔，已自動重置欄位格式。")
+        except:
+            pass # 讀取失敗也當作空檔案處理
+            
+    return pd.DataFrame(columns=expected_cols)
 
 def save_record(data_type, user_id, subject, year, q_num, action="add"):
     df = load_user_records(data_type)
@@ -51,7 +60,6 @@ def save_record(data_type, user_id, subject, year, q_num, action="add"):
     df.to_csv(f"user_{data_type}.csv", index=False)
 
 def render_content(content):
-    """【核心升級】偵測文字中是否含有 .png 圖片檔名"""
     content_str = str(content).strip()
     if ".png" in content_str.lower():
         img_path = os.path.join("images", content_str)
@@ -72,7 +80,6 @@ quiz_db = load_quiz_data()
 subject = st.sidebar.radio("選擇科目：", list(quiz_db.keys()))
 df_full = quiz_db[subject].copy()
 
-# 格式統一化
 df_full['年度-期別'] = df_full['年度-期別'].astype(str)
 df_full['題號'] = df_full['題號'].astype(str)
 
@@ -84,30 +91,27 @@ st.sidebar.divider()
 hide_done = st.sidebar.checkbox("✅ 隱藏已答對題目", value=True)
 
 # ==========================================
-# 🧠 題目過濾與重複項排除 (解決 Duplicate ID)
+# 🧠 題目過濾與重複項排除
 # ==========================================
 df_view = df_full.copy()
 if selected_year != "全部年度":
     df_view = df_view[df_view['年度-期別'] == selected_year]
 
-# 隱藏已答對 (記憶進度邏輯)
 if hide_done:
     history = load_user_records("history")
     u_hist = history[history['user_id'] == str(u_id)]
     df_view = df_view.merge(u_hist[['年度-期別', '題號']], on=['年度-期別', '題號'], how='left', indicator=True)
     df_view = df_view[df_view['_merge'] == 'left_only'].drop(columns=['_merge'])
 
-# 模式篩選
 if mode != "一般練習":
     rec_t = "wrong" if mode == "錯題重刷" else "marks"
     recs = load_user_records(rec_t)
     u_recs = recs[recs['user_id'] == str(u_id)]
     df_view = df_view.merge(u_recs[['年度-期別', '題號']], on=['年度-期別', '題號'])
 
-# 【關鍵修正】過濾後強制去重，避免 DuplicateWidgetID
 df_view = df_view.drop_duplicates(subset=['年度-期別', '題號'])
 
-# --- 分頁器 (提升反應速度) ---
+# --- 分頁器 ---
 q_per_page = 5 
 total_q = len(df_view)
 total_pages = max((total_q - 1) // q_per_page + 1, 1)
@@ -125,14 +129,12 @@ else:
 marked_df = load_user_records("marks")
 
 for _, row in df_page.iterrows():
-    # 建立唯一的題目識別碼
     q_key = f"{subject}_{row['年度-期別']}_{row['題號']}"
     
     with st.container(border=True):
         col_q, col_mark = st.columns([8, 2])
         col_q.markdown(f"#### 第 {row['題號']} 題 ({row['年度-期別']})")
         
-        # 標記狀態檢查
         is_m = ((marked_df['user_id'] == str(u_id)) & 
                 (marked_df['年度-期別'] == row['年度-期別']) & 
                 (marked_df['題號'] == row['題號'])).any()
@@ -141,23 +143,20 @@ for _, row in df_page.iterrows():
             save_record("marks", u_id, subject, row['年度-期別'], row['題號'], "remove" if is_m else "add")
             st.rerun()
 
-        # 渲染題目
         render_content(row['題目內容'])
         if pd.notna(row['圖片路徑']) and ".png" in str(row['圖片路徑']):
             render_content(row['圖片路徑'])
 
-        # 渲染選項
         user_choice = st.radio("作答：", ["A", "B", "C", "D"], key=f"radio_{q_key}", index=None, horizontal=True)
         for o in ["A", "B", "C", "D"]:
             st.write(f"**({o})**")
-            render_content(row[f'選項 {o}']) # 選項圖片也會在此被偵測
+            render_content(row[f'選項 {o}'])
 
         c1, c2, _ = st.columns([1, 1, 3])
         if c1.button("送出答案", key=f"sub_{q_key}"):
             if user_choice == str(row['正確答案']):
                 st.success("✅ 正確！")
                 save_record("history", u_id, subject, row['年度-期別'], row['題號'], "add")
-                # 答對後若開啟隱藏功能，自動重整讓題目消失
                 if hide_done: st.rerun()
             elif user_choice is None:
                 st.warning("請先選擇一個選項。")
