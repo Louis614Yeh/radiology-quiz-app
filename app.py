@@ -6,46 +6,51 @@ import google.generativeai as genai
 # ==========================================
 # ⚙️ 初始設定與 AI 配置
 # ==========================================
-st.set_page_config(page_title="放射師國考刷題神器 V3.5", layout="wide")
+st.set_page_config(page_title="放射師國考刷題神器 V3.6", layout="wide")
 
-# 安全讀取 API Key (請確認 Streamlit Secrets 裡面叫 GEMINI_API_KEY)
 try:
     if "GEMINI_API_KEY" in st.secrets:
-        genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
+        genai.configure(api_key=st.secrets["GEMINI_API_KEY"].strip()) # .strip() 幫您自動清除不小心的空格
         model = genai.GenerativeModel('gemini-1.5-flash') 
     else:
-        st.warning("⚠️ 尚未偵測到 API Key，AI 詳解功能將暫時無法使用。")
+        st.warning("⚠️ 未偵測到 API Key，請至 Streamlit Secrets 設定。")
         model = None
 except Exception as e:
     st.error(f"AI 配置出錯：{e}")
     model = None
 
 # ==========================================
-# 📂 資料處理函數 (防禦型設計)
+# 📂 暫存記憶體設定 (解決題目秒消失問題)
+# ==========================================
+if 'answered_this_round' not in st.session_state:
+    st.session_state['answered_this_round'] = []
+
+# 當換頁、換科目時，清空剛答對的暫存清單
+def clear_cache():
+    st.session_state['answered_this_round'] = []
+
+# ==========================================
+# 📂 資料處理函數
 # ==========================================
 @st.cache_data
 def load_quiz_data():
     try:
-        # 讀取題庫，強制將關鍵欄位設為字串，避免遺失補零
         excel_file = pd.ExcelFile('exam_db.xlsx') 
         db = {}
         for sheet in excel_file.sheet_names:
             df = excel_file.parse(sheet)
             df['年度-期別'] = df['年度-期別'].astype(str).str.strip()
             df['題號'] = df['題號'].astype(str).str.strip()
-            # 確保科目欄位存在
             df['科目'] = sheet
             db[sheet] = df
         return db
     except Exception as e:
-        st.error(f"讀取題庫 `exam_db.xlsx` 失敗：{e}")
+        st.error(f"讀取題庫失敗：{e}")
         st.stop()
 
 def load_user_records(data_type):
-    """【最強防呆】如果欄位不對或檔案壞掉，自動重置"""
     file = f"user_{data_type}.csv"
     required_cols = ['user_id', '科目', '年度-期別', '題號']
-    
     if os.path.exists(file):
         try:
             df = pd.read_csv(file).astype(str)
@@ -82,21 +87,19 @@ def render_content(content):
 # 📱 介面控制
 # ==========================================
 st.sidebar.title("🩺 放射師專屬題庫")
-u_id = st.sidebar.selectbox("切換使用者：", ["614", "941", "Guest"])
+u_id = st.sidebar.selectbox("切換使用者：", ["614", "941", "Guest"], on_change=clear_cache)
 
 quiz_db = load_quiz_data()
-subject = st.sidebar.radio("選擇科目：", list(quiz_db.keys()))
+subject = st.sidebar.radio("選擇科目：", list(quiz_db.keys()), on_change=clear_cache)
 df_full = quiz_db[subject].copy()
 
-# 過濾掉 nan 年度
 valid_years = sorted([y for y in df_full['年度-期別'].unique() if str(y).lower() != 'nan'])
-selected_year = st.sidebar.selectbox("選擇年度：", ["全部年度"] + valid_years)
+selected_year = st.sidebar.selectbox("選擇年度：", ["全部年度"] + valid_years, on_change=clear_cache)
 
-mode = st.sidebar.selectbox("模式：", ["一般練習", "錯題重刷", "標記題庫"])
+mode = st.sidebar.selectbox("模式：", ["一般練習", "錯題重刷", "標記題庫"], on_change=clear_cache)
 st.sidebar.divider()
 hide_done = st.sidebar.checkbox("✅ 隱藏已答對題目", value=True)
 
-# 增加進度清除按鈕 (萬一檔案又亂掉可以重來)
 if st.sidebar.button("🗑️ 清除當前使用者進度"):
     for t in ["history", "wrong", "marks"]:
         file = f"user_{t}.csv"
@@ -104,25 +107,29 @@ if st.sidebar.button("🗑️ 清除當前使用者進度"):
             df = pd.read_csv(file)
             df = df[df['user_id'] != str(u_id)]
             df.to_csv(file, index=False)
+    clear_cache()
     st.rerun()
 
 # ==========================================
-# 🧠 核心過濾邏輯 (修正比對報錯)
+# 🧠 核心過濾邏輯
 # ==========================================
 df_view = df_full.copy()
 if selected_year != "全部年度":
     df_view = df_view[df_view['年度-期別'] == str(selected_year)]
 
-# 隱藏已答對
+# 【完美體驗版】隱藏已答對，但保留「剛答對還沒翻頁」的題目
 if hide_done:
     history = load_user_records("history")
-    u_hist = history[history['user_id'] == str(u_id)]
+    u_hist = history[history['user_id'] == str(u_id)].copy()
     if not u_hist.empty:
-        # 確保兩邊比對的欄位型態完全一致
-        df_view = df_view.merge(u_hist[['年度-期別', '題號']], on=['年度-期別', '題號'], how='left', indicator=True)
+        # 將題目轉為字串 ID 來比對
+        u_hist['q_key_str'] = u_hist['年度-期別'].astype(str) + "_" + u_hist['題號'].astype(str)
+        # 排除掉這一回合才剛答對的題目（讓它們繼續留在畫面上）
+        u_hist_to_hide = u_hist[~u_hist['q_key_str'].isin(st.session_state['answered_this_round'])]
+        
+        df_view = df_view.merge(u_hist_to_hide[['年度-期別', '題號']], on=['年度-期別', '題號'], how='left', indicator=True)
         df_view = df_view[df_view['_merge'] == 'left_only'].drop(columns=['_merge'])
 
-# 模式篩選
 if mode != "一般練習":
     rec_t = "wrong" if mode == "錯題重刷" else "marks"
     recs = load_user_records(rec_t)
@@ -130,18 +137,18 @@ if mode != "一般練習":
     if not u_recs.empty:
         df_view = df_view.merge(u_recs[['年度-期別', '題號']], on=['年度-期別', '題號'])
     else:
-        df_view = pd.DataFrame() # 沒資料就清空
+        df_view = pd.DataFrame()
 
-# 強制去重
 df_view = df_view.drop_duplicates(subset=['年度-期別', '題號'])
 
-# --- 🚀 分頁器 (效能救星) ---
+# --- 🚀 分頁器 ---
 q_per_page = 5 
 total_q = len(df_view)
 total_pages = max((total_q - 1) // q_per_page + 1, 1)
 
 if total_q > 0:
-    page = st.sidebar.number_input(f"頁數 (共 {total_pages} 頁)", 1, total_pages, 1)
+    # 當頁數改變時，清空剛答對的暫存清單，讓隱藏邏輯生效
+    page = st.sidebar.number_input(f"頁數 (共 {total_pages} 頁)", 1, total_pages, 1, on_change=clear_cache)
     df_page = df_view.iloc[(page-1)*q_per_page : page*q_per_page]
     st.caption(f"目前篩選出 {total_q} 題，正在顯示第 {page} 頁")
 else:
@@ -155,12 +162,12 @@ marked_df = load_user_records("marks")
 
 for _, row in df_page.iterrows():
     q_key = f"{subject}_{row['年度-期別']}_{row['題號']}"
+    str_key = f"{row['年度-期別']}_{row['題號']}"
     
     with st.container(border=True):
         col_q, col_mark = st.columns([8, 2])
         col_q.markdown(f"#### 第 {row['題號']} 題 ({row['年度-期別']})")
         
-        # 標記按鈕
         is_m = ((marked_df['user_id'] == str(u_id)) & 
                 (marked_df['年度-期別'] == str(row['年度-期別'])) & 
                 (marked_df['題號'] == str(row['題號']))).any()
@@ -169,12 +176,10 @@ for _, row in df_page.iterrows():
             save_record("marks", u_id, subject, row['年度-期別'], row['題號'], "remove" if is_m else "add")
             st.rerun()
 
-        # 顯示題目
         render_content(row['題目內容'])
         if pd.notna(row['圖片路徑']) and ".png" in str(row['圖片路徑']):
             render_content(row['圖片路徑'])
 
-        # 顯示選項 (自動偵測圖片)
         user_choice = st.radio("作答：", ["A", "B", "C", "D"], key=f"radio_{q_key}", index=None, horizontal=True)
         for o in ["A", "B", "C", "D"]:
             st.write(f"**({o})**")
@@ -184,8 +189,9 @@ for _, row in df_page.iterrows():
         if c1.button("送出答案", key=f"sub_{q_key}"):
             if user_choice == str(row['正確答案']):
                 st.success("✅ 正確！")
+                # 存檔，並加入「本回合暫存區」，讓題目暫時不下架
                 save_record("history", u_id, subject, row['年度-期別'], row['題號'], "add")
-                if hide_done: st.rerun()
+                st.session_state['answered_this_round'].append(str_key)
             elif user_choice is None:
                 st.warning("請先選擇一個選項。")
             else:
@@ -200,6 +206,6 @@ for _, row in df_page.iterrows():
                         response = model.generate_content(prompt)
                         st.info(response.text)
                     except Exception as ai_e:
-                        st.error(f"AI 暫時罷工：{ai_e}")
+                        st.error(f"請確認 API Key 格式是否正確。系統錯誤：{ai_e}")
             else:
-                st.error("請先在 Secrets 設定 API Key 以啟用詳解功能。")
+                st.error("請先在 Secrets 設定正確的 GEMINI_API_KEY。")
