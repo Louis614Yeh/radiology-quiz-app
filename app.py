@@ -11,7 +11,7 @@ st.set_page_config(page_title="放射師國考刷題神器 V3.7", layout="wide")
 try:
     if "GEMINI_API_KEY" in st.secrets:
         genai.configure(api_key=st.secrets["GEMINI_API_KEY"].strip())
-        model = genai.GenerativeModel('gemini-1.5-flash') 
+        model = genai.GenerativeModel('gemini-2.5-flash') 
     else:
         st.warning("⚠️ 未偵測到 API Key，請至 Streamlit Secrets 設定。")
         model = None
