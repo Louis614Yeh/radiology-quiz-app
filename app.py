@@ -7,13 +7,12 @@ from streamlit_gsheets import GSheetsConnection
 # ==========================================
 # ⚙️ 初始設定與 AI 配置
 # ==========================================
-st.set_page_config(page_title="放射師國考刷題神器 V4.0", layout="wide")
+st.set_page_config(page_title="放射師國考刷題神器 V4.1", layout="wide")
 
 try:
     if "GEMINI_API_KEY" in st.secrets:
         genai.configure(api_key=st.secrets["GEMINI_API_KEY"].strip())
-        # 已升級為精準度更高的 pro 模型
-        model = genai.GenerativeModel('gemini-3.1-flash-lite') 
+        model = genai.GenerativeModel('gemini-3.1-pro') 
     else:
         st.warning("⚠️ 未偵測到 API Key，請至 Streamlit Secrets 設定。")
         model = None
@@ -27,7 +26,6 @@ except Exception as e:
 conn = st.connection("gsheets", type=GSheetsConnection)
 
 def clear_cache():
-    """當切換科目、使用者或模式時，清除暫存的題號，讓系統重新去資料庫抓進度"""
     if 'current_q_index' in st.session_state:
         del st.session_state['current_q_index']
 
@@ -50,8 +48,8 @@ def load_quiz_data():
 def load_user_records(data_type):
     """從 Google Sheets 讀取特定分頁的資料"""
     try:
-        df = conn.read(worksheet=data_type) 
-        # 確保讀下來的是字串，並把全空的 row 丟掉
+        # 🌟 關鍵修復：加入 ttl=0，強迫系統每次都去雲端抓最新資料，拒絕使用舊暫存
+        df = conn.read(worksheet=data_type, ttl=0) 
         return df.dropna(how="all").astype(str)
     except Exception as e:
         st.error(f"讀取 {data_type} 失敗：{e}")
@@ -62,7 +60,6 @@ def save_record(data_type, user_id, subject, year, q_num, action="add"):
     df = load_user_records(data_type)
     u, s, y, q = str(user_id), str(subject), str(year), str(q_num)
     
-    # 防呆：確保 DataFrame 有正確的欄位
     if not df.empty and all(col in df.columns for col in ['user_id', '科目', '年度-期別', '題號']):
         mask = (df['user_id'] == u) & (df['科目'] == s) & (df['年度-期別'] == y) & (df['題號'] == q)
     else:
@@ -75,22 +72,10 @@ def save_record(data_type, user_id, subject, year, q_num, action="add"):
     elif action == "remove" and mask.any():
         df = df[~mask]
         
-    # 覆寫回 Google Sheets
     conn.update(worksheet=data_type, data=df)
 
-def render_content(content):
-    content_str = str(content).strip()
-    if ".png" in content_str.lower():
-        img_path = os.path.join("images", content_str)
-        if os.path.exists(img_path):
-            st.image(img_path, width=450)
-        else:
-            st.warning(f"🖼️ 找不到圖檔：{content_str}")
-    elif content_str != "nan":
-        st.write(content_str)
-
 # ==========================================
-# 📱 介面控制 (先定義 u_id 和 subject，供後續邏輯使用)
+# 📱 介面控制
 # ==========================================
 st.sidebar.title("🩺 放射師專屬題庫")
 u_id = st.sidebar.selectbox("切換使用者：", ["614", "941", "Guest"], on_change=clear_cache)
@@ -106,7 +91,6 @@ mode = st.sidebar.selectbox("模式：", ["一般練習", "錯題重刷", "標�
 st.sidebar.divider()
 hide_done = st.sidebar.checkbox("✅ 隱藏已答對題目", value=True, on_change=clear_cache)
 
-# 清除進度功能 (已改寫為清除 Google Sheets 上的該使用者資料)
 if st.sidebar.button("🗑️ 清除當前使用者進度"):
     for t in ["history", "wrong", "marks", "progress"]:
         df = load_user_records(t)
@@ -145,15 +129,13 @@ if mode != "一般練習":
         df_view = pd.DataFrame()
 
 df_view = df_view.drop_duplicates(subset=['年度-期別', '題號'])
-# 重設 index，確保我們用 iloc 抓取單題時不會對應錯誤
 df_view = df_view.reset_index(drop=True)
 
 # ==========================================
-# 🧠 閃卡進度記憶邏輯 (必須放在 u_id、subject 以及過濾器之後)
+# 🧠 閃卡進度記憶與切換邏輯 
 # ==========================================
 progress_df = load_user_records("progress")
 
-# 防呆：如果 progress 表格是空的，先給它預設欄位避免報錯
 if progress_df.empty or 'user_id' not in progress_df.columns:
     progress_df = pd.DataFrame(columns=['user_id', '科目', 'current_index'])
 
@@ -161,18 +143,19 @@ current_prog_mask = (progress_df['user_id'] == str(u_id)) & (progress_df['科目
 
 if 'current_q_index' not in st.session_state:
     if current_prog_mask.any():
-        # 如果雲端有進度，抓取雲端進度
         saved_index = int(progress_df[current_prog_mask]['current_index'].values[0])
         st.session_state['current_q_index'] = saved_index
     else:
-        # 如果沒有進度，從第 0 題開始
         st.session_state['current_q_index'] = 0
 
-def next_question():
-    """切換到下一題，並將進度存回 Google Sheets"""
-    st.session_state['current_q_index'] += 1
+def change_question(delta):
+    """🌟 新增：統一處理上一題、下一題的進度切換"""
+    new_index = st.session_state['current_q_index'] + delta
+    if new_index < 0:
+        new_index = 0
+        
+    st.session_state['current_q_index'] = new_index
     
-    # 更新進度表
     prog_df = load_user_records("progress")
     if prog_df.empty or 'user_id' not in prog_df.columns:
         prog_df = pd.DataFrame(columns=['user_id', '科目', 'current_index'])
@@ -180,24 +163,22 @@ def next_question():
     mask = (prog_df['user_id'] == str(u_id)) & (prog_df['科目'] == subject)
     
     if mask.any():
-        prog_df.loc[mask, 'current_index'] = str(st.session_state['current_q_index'])
+        prog_df.loc[mask, 'current_index'] = str(new_index)
     else:
-        new_prog = pd.DataFrame([[str(u_id), subject, str(st.session_state['current_q_index'])]], columns=['user_id', '科目', 'current_index'])
+        new_prog = pd.DataFrame([[str(u_id), subject, str(new_index)]], columns=['user_id', '科目', 'current_index'])
         prog_df = pd.concat([prog_df, new_prog], ignore_index=True)
         
     conn.update(worksheet="progress", data=prog_df)
 
 # ==========================================
-# ✍️ 測驗主畫面 (一頁一題模式)
+# ✍️ 測驗主畫面 
 # ==========================================
 total_q = len(df_view)
 
 if total_q > 0:
-    # 防呆：如果篩選後的題數變少（例如隱藏了剛答對的題目），導致索引越界，自動歸零
     if st.session_state['current_q_index'] >= total_q:
         st.session_state['current_q_index'] = 0  
         
-    # 🟢 只抓取當前這 "1" 題的資料
     row = df_view.iloc[st.session_state['current_q_index']]
     q_key = f"{subject}_{row['年度-期別']}_{row['題號']}"
     
@@ -207,7 +188,6 @@ if total_q > 0:
         col_q, col_mark = st.columns([8, 2])
         col_q.markdown(f"#### 第 {row['題號']} 題 ({row['年度-期別']})")
         
-        # 標記按鈕邏輯
         marked_df = load_user_records("marks")
         is_m = False
         if not marked_df.empty and 'user_id' in marked_df.columns:
@@ -219,12 +199,10 @@ if total_q > 0:
             save_record("marks", u_id, subject, row['年度-期別'], row['題號'], "remove" if is_m else "add")
             st.rerun()
 
-        # 渲染題目與圖片
         render_content(row['題目內容'])
         if pd.notna(row['圖片路徑']) and ".png" in str(row['圖片路徑']):
             render_content(row['圖片路徑'])
 
-        # 作答區
         user_choice = st.radio("作答：", ["A", "B", "C", "D"], key=f"radio_{q_key}", index=None, horizontal=True)
         for o in ["A", "B", "C", "D"]:
             st.write(f"**({o})**")
@@ -232,8 +210,8 @@ if total_q > 0:
 
         st.divider()
         
-        # 按鈕區
-        c1, c2, c3 = st.columns([1, 1, 2])
+        # 🌟 修改：切割成四個區塊，放入上一題功能
+        c1, c2, c3, c4 = st.columns([1.5, 1.5, 1, 1])
         
         if c1.button("送出答案", key=f"sub_{q_key}"):
             if user_choice == str(row['正確答案']):
@@ -257,9 +235,14 @@ if total_q > 0:
             else:
                 st.error("請先在 Secrets 設定正確的 GEMINI_API_KEY。")
 
-        # 下一題按鈕 (綁定進度儲存功能)
-        if c3.button("➡️ 下一題", type="primary"):
-            next_question()
+        # 🌟 新增：上一題按鈕 (搭配防呆，如果在第1題就不給按)
+        is_first_q = (st.session_state['current_q_index'] == 0)
+        if c3.button("⬅️ 上一題", disabled=is_first_q):
+            change_question(-1)
+            st.rerun()
+
+        if c4.button("➡️ 下一題", type="primary"):
+            change_question(1)
             st.rerun()
 else:
     st.success("🎉 目前已無題目！太棒了！")
