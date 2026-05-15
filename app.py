@@ -7,7 +7,7 @@ from streamlit_gsheets import GSheetsConnection
 # ==========================================
 # ⚙️ 初始設定與 AI 配置
 # ==========================================
-st.set_page_config(page_title="放射師國考刷題神器 V4.1", layout="wide")
+st.set_page_config(page_title="放射師國考刷題神器 V4.2", layout="wide")
 
 try:
     if "GEMINI_API_KEY" in st.secrets:
@@ -45,34 +45,51 @@ def load_quiz_data():
         st.error(f"讀取題庫失敗：{e}")
         st.stop()
 
+# 🌟 V4.2 核心升級：本地記憶體同步機制
 def load_user_records(data_type):
-    """從 Google Sheets 讀取特定分頁的資料"""
-    try:
-        # 🌟 關鍵修復：加入 ttl=0，強迫系統每次都去雲端抓最新資料，拒絕使用舊暫存
-        df = conn.read(worksheet=data_type, ttl=0) 
-        return df.dropna(how="all").astype(str)
-    except Exception as e:
-        st.error(f"讀取 {data_type} 失敗：{e}")
-        return pd.DataFrame()
+    """優先從網頁記憶體抓取資料，大幅降低 Google API 讀取次數"""
+    session_key = f"db_{data_type}"
+    
+    if session_key not in st.session_state:
+        try:
+            # ttl=30，只允許每半分鐘去雲端撈一次，避免 429 錯誤
+            df = conn.read(worksheet=data_type, ttl=30) 
+            st.session_state[session_key] = df.dropna(how="all").astype(str)
+        except Exception as e:
+            # 如果真的遇到 API 爆炸，回傳空資料表避免當機
+            return pd.DataFrame()
+            
+    return st.session_state[session_key].copy()
 
 def save_record(data_type, user_id, subject, year, q_num, action="add"):
-    """寫入資料到 Google Sheets"""
+    """寫入資料並同步更新本地與雲端"""
     df = load_user_records(data_type)
     u, s, y, q = str(user_id), str(subject), str(year), str(q_num)
     
-    if not df.empty and all(col in df.columns for col in ['user_id', '科目', '年度-期別', '題號']):
-        mask = (df['user_id'] == u) & (df['科目'] == s) & (df['年度-期別'] == y) & (df['題號'] == q)
-    else:
+    # 防呆：確認欄位完整
+    if df.empty or not all(col in df.columns for col in ['user_id', '科目', '年度-期別', '題號']):
         df = pd.DataFrame(columns=['user_id', '科目', '年度-期別', '題號'])
-        mask = pd.Series([False])
 
+    mask = (df['user_id'] == u) & (df['科目'] == s) & (df['年度-期別'] == y) & (df['題號'] == q)
+    
+    changed = False
     if action == "add" and not mask.any():
         new_row = pd.DataFrame([[u, s, y, q]], columns=df.columns)
         df = pd.concat([df, new_row], ignore_index=True)
+        changed = True
     elif action == "remove" and mask.any():
         df = df[~mask]
+        changed = True
         
-    conn.update(worksheet=data_type, data=df)
+    if changed:
+        # 1. 瞬間更新本地端 (網頁畫面立刻改變)
+        st.session_state[f"db_{data_type}"] = df
+        # 2. 背景上傳至 Google Sheets
+        try:
+            conn.update(worksheet=data_type, data=df)
+            st.cache_data.clear() # 提醒系統雲端資料已換新
+        except Exception as e:
+            st.toast("⚠️ 點擊過快，雲端同步稍有延遲，但不影響目前使用！")
 
 def render_content(content):
     content_str = str(content).strip()
@@ -107,7 +124,12 @@ if st.sidebar.button("🗑️ 清除當前使用者進度"):
         df = load_user_records(t)
         if not df.empty and 'user_id' in df.columns:
             df = df[df['user_id'] != str(u_id)]
-            conn.update(worksheet=t, data=df)
+            st.session_state[f"db_{t}"] = df  # 更新本地端
+            try:
+                conn.update(worksheet=t, data=df) # 更新雲端
+            except:
+                pass
+    st.cache_data.clear()
     clear_cache()
     st.success("已清除雲端進度！")
     st.rerun()
@@ -160,7 +182,7 @@ if 'current_q_index' not in st.session_state:
         st.session_state['current_q_index'] = 0
 
 def change_question(delta):
-    """🌟 新增：統一處理上一題、下一題的進度切換"""
+    """切換上下題，並安全地同步進度到雲端"""
     new_index = st.session_state['current_q_index'] + delta
     if new_index < 0:
         new_index = 0
@@ -179,7 +201,15 @@ def change_question(delta):
         new_prog = pd.DataFrame([[str(u_id), subject, str(new_index)]], columns=['user_id', '科目', 'current_index'])
         prog_df = pd.concat([prog_df, new_prog], ignore_index=True)
         
-    conn.update(worksheet="progress", data=prog_df)
+    # 1. 瞬間更新本地端進度
+    st.session_state["db_progress"] = prog_df
+    
+    # 2. 嘗試上傳至雲端
+    try:
+        conn.update(worksheet="progress", data=prog_df)
+        st.cache_data.clear()
+    except Exception:
+        pass # 按鈕點太快時忽略錯誤，本地端記憶仍在
 
 # ==========================================
 # ✍️ 測驗主畫面 
@@ -221,7 +251,6 @@ if total_q > 0:
 
         st.divider()
         
-        # 🌟 修改：切割成四個區塊，放入上一題功能
         c1, c2, c3, c4 = st.columns([1.5, 1.5, 1, 1])
         
         if c1.button("送出答案", key=f"sub_{q_key}"):
@@ -246,7 +275,6 @@ if total_q > 0:
             else:
                 st.error("請先在 Secrets 設定正確的 GEMINI_API_KEY。")
 
-        # 🌟 新增：上一題按鈕 (搭配防呆，如果在第1題就不給按)
         is_first_q = (st.session_state['current_q_index'] == 0)
         if c3.button("⬅️ 上一題", disabled=is_first_q):
             change_question(-1)
