@@ -74,6 +74,17 @@ def save_record(data_type, user_id, subject, year, q_num, action="add"):
         
     conn.update(worksheet=data_type, data=df)
 
+def render_content(content):
+    content_str = str(content).strip()
+    if ".png" in content_str.lower():
+        img_path = os.path.join("images", content_str)
+        if os.path.exists(img_path):
+            st.image(img_path, width=450)
+        else:
+            st.warning(f"🖼️ 找不到圖檔：{content_str}")
+    elif content_str != "nan":
+        st.write(content_str)
+
 # ==========================================
 # 📱 介面控制
 # ==========================================
