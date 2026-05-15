@@ -13,7 +13,7 @@ try:
     if "GEMINI_API_KEY" in st.secrets:
         genai.configure(api_key=st.secrets["GEMINI_API_KEY"].strip())
         # 已升級為精準度更高的 pro 模型
-        model = genai.GenerativeModel('gemini-2.5-flash') 
+        model = genai.GenerativeModel('Gemini-3.1-Flash-Lite') 
     else:
         st.warning("⚠️ 未偵測到 API Key，請至 Streamlit Secrets 設定。")
         model = None
