@@ -7,7 +7,7 @@ from streamlit_gsheets import GSheetsConnection
 # ==========================================
 # ⚙️ 初始設定與 AI 配置
 # ==========================================
-st.set_page_config(page_title="放射師國考刷題神器 V4.3", layout="wide")
+st.set_page_config(page_title="放射師國考刷題神器 V4.4", layout="wide")
 
 try:
     if "GEMINI_API_KEY" in st.secrets:
@@ -25,9 +25,15 @@ except Exception as e:
 # ==========================================
 conn = st.connection("gsheets", type=GSheetsConnection)
 
+# 🌟 V4.4 修復：初始化「這回合答對」的保護傘
+if 'answered_this_round' not in st.session_state:
+    st.session_state['answered_this_round'] = []
+
 def clear_cache():
     if 'current_q_index' in st.session_state:
         del st.session_state['current_q_index']
+    # 切換科目時，清空保護傘
+    st.session_state['answered_this_round'] = []
 
 @st.cache_data
 def load_quiz_data():
@@ -45,25 +51,18 @@ def load_quiz_data():
         st.error(f"讀取題庫失敗：{e}")
         st.stop()
 
-# 🌟 V4.3 核心升級：修正 .0 陷阱與錯誤捕捉
 def load_user_records(data_type):
     session_key = f"db_{data_type}"
     if session_key not in st.session_state:
         try:
-            # 放寬讀取快取時間，減少 API 壓力
             df = conn.read(worksheet=data_type, ttl=600) 
-            
-            # 🧹 資料清洗：把 614.0 變回 614，108.0 變回 108
             df = df.dropna(how="all").astype(str)
             for col in df.columns:
                 df[col] = df[col].str.replace(r'\.0$', '', regex=True).str.strip()
-                
             st.session_state[session_key] = df
         except Exception as e:
-            # 不再默默失敗，明確告訴你是不是 API 卡住了
             st.error(f"⚠️ 讀取 {data_type} 失敗！可能是 Google API 暫時阻擋，請稍後重試。")
             return pd.DataFrame()
-            
     return st.session_state[session_key].copy()
 
 def save_record(data_type, user_id, subject, year, q_num, action="add"):
@@ -90,7 +89,6 @@ def save_record(data_type, user_id, subject, year, q_num, action="add"):
             conn.update(worksheet=data_type, data=df)
             st.cache_data.clear() 
         except Exception as e:
-            # 提醒你按太快沒存到雲端
             st.toast("⚠️ 點擊過快，雲端同步失敗，但不影響目前網頁進度！")
 
 def render_content(content):
@@ -146,9 +144,13 @@ if selected_year != "全部年度":
 if hide_done and mode != "標記題庫":
     history = load_user_records("history")
     if not history.empty and 'user_id' in history.columns:
-        u_hist = history[history['user_id'] == str(u_id)]
+        u_hist = history[history['user_id'] == str(u_id)].copy() # 🌟 加上 .copy() 避免警告
         if not u_hist.empty:
-            df_view = df_view.merge(u_hist[['年度-期別', '題號']], on=['年度-期別', '題號'], how='left', indicator=True)
+            # 🌟 V4.4 修復：保護「這回合」剛答對的題目，不要把它們從清單刪除，避免跳題位移
+            u_hist['q_key_str'] = u_hist['年度-期別'].astype(str) + "_" + u_hist['題號'].astype(str)
+            u_hist_to_hide = u_hist[~u_hist['q_key_str'].isin(st.session_state['answered_this_round'])]
+            
+            df_view = df_view.merge(u_hist_to_hide[['年度-期別', '題號']], on=['年度-期別', '題號'], how='left', indicator=True)
             df_view = df_view[df_view['_merge'] == 'left_only'].drop(columns=['_merge'])
 
 if mode != "一般練習":
@@ -178,7 +180,6 @@ current_prog_mask = (progress_df['user_id'] == str(u_id)) & (progress_df['科目
 
 if 'current_q_index' not in st.session_state:
     if current_prog_mask.any():
-        # 🌟 V4.3 修正：確保小數點轉型不會當機
         saved_index = int(float(progress_df[current_prog_mask]['current_index'].values[0]))
         st.session_state['current_q_index'] = saved_index
     else:
@@ -217,11 +218,13 @@ def change_question(delta):
 total_q = len(df_view)
 
 if total_q > 0:
+    # 防呆修正：如果目前進度超過了總題數，強制回到第0題
     if st.session_state['current_q_index'] >= total_q:
         st.session_state['current_q_index'] = 0  
         
     row = df_view.iloc[st.session_state['current_q_index']]
     q_key = f"{subject}_{row['年度-期別']}_{row['題號']}"
+    str_key = f"{row['年度-期別']}_{row['題號']}" # 給回合保護傘用的 Key
     
     st.progress((st.session_state['current_q_index'] + 1) / total_q, text=f"進度：{st.session_state['current_q_index'] + 1} / {total_q} 題")
     
@@ -257,6 +260,10 @@ if total_q > 0:
             if user_choice == str(row['正確答案']):
                 st.success("✅ 正確！")
                 save_record("history", u_id, subject, row['年度-期別'], row['題號'], "add")
+                
+                # 🌟 V4.4 修復：將答對的題目加入保護傘，避免立刻跳題
+                if str_key not in st.session_state['answered_this_round']:
+                    st.session_state['answered_this_round'].append(str_key)
             elif user_choice is None:
                 st.warning("請先選擇一個選項。")
             else:
@@ -275,12 +282,13 @@ if total_q > 0:
             else:
                 st.error("請先在 Secrets 設定正確的 GEMINI_API_KEY。")
 
+        # 🌟 V4.4 修復：加入專屬的 key (prev_{q_key} 和 next_{q_key})，徹底消滅幽靈連點
         is_first_q = (st.session_state['current_q_index'] == 0)
-        if c3.button("⬅️ 上一題", disabled=is_first_q):
+        if c3.button("⬅️ 上一題", key=f"prev_{q_key}", disabled=is_first_q):
             change_question(-1)
             st.rerun()
 
-        if c4.button("➡️ 下一題", type="primary"):
+        if c4.button("➡️ 下一題", key=f"next_{q_key}", type="primary"):
             change_question(1)
             st.rerun()
 else:
