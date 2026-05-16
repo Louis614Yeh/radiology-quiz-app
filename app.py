@@ -7,12 +7,12 @@ from streamlit_gsheets import GSheetsConnection
 # ==========================================
 # ⚙️ 初始設定與 AI 配置
 # ==========================================
-st.set_page_config(page_title="放射師國考刷題神器 V4.2", layout="wide")
+st.set_page_config(page_title="放射師國考刷題神器 V4.3", layout="wide")
 
 try:
     if "GEMINI_API_KEY" in st.secrets:
         genai.configure(api_key=st.secrets["GEMINI_API_KEY"].strip())
-        model = genai.GenerativeModel('gemini-3.1-flash-lite') 
+        model = genai.GenerativeModel('gemini-3.1-pro') 
     else:
         st.warning("⚠️ 未偵測到 API Key，請至 Streamlit Secrets 設定。")
         model = None
@@ -45,28 +45,31 @@ def load_quiz_data():
         st.error(f"讀取題庫失敗：{e}")
         st.stop()
 
-# 🌟 V4.2 核心升級：本地記憶體同步機制
+# 🌟 V4.3 核心升級：修正 .0 陷阱與錯誤捕捉
 def load_user_records(data_type):
-    """優先從網頁記憶體抓取資料，大幅降低 Google API 讀取次數"""
     session_key = f"db_{data_type}"
-    
     if session_key not in st.session_state:
         try:
-            # ttl=30，只允許每半分鐘去雲端撈一次，避免 429 錯誤
-            df = conn.read(worksheet=data_type, ttl=30) 
-            st.session_state[session_key] = df.dropna(how="all").astype(str)
+            # 放寬讀取快取時間，減少 API 壓力
+            df = conn.read(worksheet=data_type, ttl=600) 
+            
+            # 🧹 資料清洗：把 614.0 變回 614，108.0 變回 108
+            df = df.dropna(how="all").astype(str)
+            for col in df.columns:
+                df[col] = df[col].str.replace(r'\.0$', '', regex=True).str.strip()
+                
+            st.session_state[session_key] = df
         except Exception as e:
-            # 如果真的遇到 API 爆炸，回傳空資料表避免當機
+            # 不再默默失敗，明確告訴你是不是 API 卡住了
+            st.error(f"⚠️ 讀取 {data_type} 失敗！可能是 Google API 暫時阻擋，請稍後重試。")
             return pd.DataFrame()
             
     return st.session_state[session_key].copy()
 
 def save_record(data_type, user_id, subject, year, q_num, action="add"):
-    """寫入資料並同步更新本地與雲端"""
     df = load_user_records(data_type)
     u, s, y, q = str(user_id), str(subject), str(year), str(q_num)
     
-    # 防呆：確認欄位完整
     if df.empty or not all(col in df.columns for col in ['user_id', '科目', '年度-期別', '題號']):
         df = pd.DataFrame(columns=['user_id', '科目', '年度-期別', '題號'])
 
@@ -82,14 +85,13 @@ def save_record(data_type, user_id, subject, year, q_num, action="add"):
         changed = True
         
     if changed:
-        # 1. 瞬間更新本地端 (網頁畫面立刻改變)
         st.session_state[f"db_{data_type}"] = df
-        # 2. 背景上傳至 Google Sheets
         try:
             conn.update(worksheet=data_type, data=df)
-            st.cache_data.clear() # 提醒系統雲端資料已換新
+            st.cache_data.clear() 
         except Exception as e:
-            st.toast("⚠️ 點擊過快，雲端同步稍有延遲，但不影響目前使用！")
+            # 提醒你按太快沒存到雲端
+            st.toast("⚠️ 點擊過快，雲端同步失敗，但不影響目前網頁進度！")
 
 def render_content(content):
     content_str = str(content).strip()
@@ -124,9 +126,9 @@ if st.sidebar.button("🗑️ 清除當前使用者進度"):
         df = load_user_records(t)
         if not df.empty and 'user_id' in df.columns:
             df = df[df['user_id'] != str(u_id)]
-            st.session_state[f"db_{t}"] = df  # 更新本地端
+            st.session_state[f"db_{t}"] = df  
             try:
-                conn.update(worksheet=t, data=df) # 更新雲端
+                conn.update(worksheet=t, data=df) 
             except:
                 pass
     st.cache_data.clear()
@@ -176,13 +178,13 @@ current_prog_mask = (progress_df['user_id'] == str(u_id)) & (progress_df['科目
 
 if 'current_q_index' not in st.session_state:
     if current_prog_mask.any():
-        saved_index = int(progress_df[current_prog_mask]['current_index'].values[0])
+        # 🌟 V4.3 修正：確保小數點轉型不會當機
+        saved_index = int(float(progress_df[current_prog_mask]['current_index'].values[0]))
         st.session_state['current_q_index'] = saved_index
     else:
         st.session_state['current_q_index'] = 0
 
 def change_question(delta):
-    """切換上下題，並安全地同步進度到雲端"""
     new_index = st.session_state['current_q_index'] + delta
     if new_index < 0:
         new_index = 0
@@ -201,15 +203,13 @@ def change_question(delta):
         new_prog = pd.DataFrame([[str(u_id), subject, str(new_index)]], columns=['user_id', '科目', 'current_index'])
         prog_df = pd.concat([prog_df, new_prog], ignore_index=True)
         
-    # 1. 瞬間更新本地端進度
     st.session_state["db_progress"] = prog_df
     
-    # 2. 嘗試上傳至雲端
     try:
         conn.update(worksheet="progress", data=prog_df)
         st.cache_data.clear()
     except Exception:
-        pass # 按鈕點太快時忽略錯誤，本地端記憶仍在
+        pass 
 
 # ==========================================
 # ✍️ 測驗主畫面 
